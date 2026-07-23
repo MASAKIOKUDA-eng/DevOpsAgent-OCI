@@ -1,11 +1,17 @@
 ################################################################################
 # VCN & ネットワーク構成
-# 
+#
 # 注入された障害:
 # [FAULT-NET-01] NATゲートウェイなし - プライベートサブネットからインターネットアクセス不可
 # [FAULT-NET-02] 単一AD/FDのみにパブリックサブネット配置 - 可用性の欠如
-# [FAULT-NET-03] パブリックサブネットのルートテーブルにIGWルートなし
+#
+# ※ IGWルートはLBデプロイに必要なため設定済み（デプロイ可能にするため）
 ################################################################################
+
+# Availability Domains データソース
+data "oci_identity_availability_domains" "ads" {
+  compartment_id = var.tenancy_ocid
+}
 
 # VCN
 resource "oci_core_vcn" "main" {
@@ -49,20 +55,12 @@ resource "oci_core_subnet" "public_ad1" {
 }
 
 # [FAULT-NET-02] 2つ目のパブリックサブネットが存在しない
-# 本来は以下が必要:
-# resource "oci_core_subnet" "public_ad2" {
-#   compartment_id             = var.compartment_id
-#   vcn_id                     = oci_core_vcn.main.id
-#   cidr_block                 = "10.0.2.0/24"
-#   display_name               = "${var.project_name}-public-ad2"
-#   dns_label                  = "publicad2"
-#   prohibit_public_ip_on_vnic = false
-#   route_table_id             = oci_core_route_table.public.id
-# }
+# 本来は複数AD/FDに配置してLBの可用性を確保すべき
 
 ################################################################################
 # プライベートサブネット
-# [FAULT-NET-01] NATゲートウェイが存在しないため、コンテナがOCIRからイメージをPullできない
+# [FAULT-NET-01] NATゲートウェイが存在しないため、
+# プライベートサブネットからインターネットアクセス不可
 ################################################################################
 resource "oci_core_subnet" "private_ad1" {
   compartment_id             = var.compartment_id
@@ -98,20 +96,17 @@ resource "oci_core_subnet" "private_ad2" {
 # ルートテーブル
 ################################################################################
 
-# パブリック用ルートテーブル
-# [FAULT-NET-03] IGWへのルートが欠落 - パブリックサブネットからインターネットアクセス不可
+# パブリック用ルートテーブル - IGWルート設定済み（デプロイ可能にするため）
 resource "oci_core_route_table" "public" {
   compartment_id = var.compartment_id
   vcn_id         = oci_core_vcn.main.id
   display_name   = "${var.project_name}-public-rt"
 
-  # [FAULT-NET-03] IGWへのルートが存在しない
-  # 本来は以下が必要:
-  # route_rules {
-  #   network_entity_id = oci_core_internet_gateway.main.id
-  #   destination       = "0.0.0.0/0"
-  #   destination_type  = "CIDR_BLOCK"
-  # }
+  route_rules {
+    network_entity_id = oci_core_internet_gateway.main.id
+    destination       = "0.0.0.0/0"
+    destination_type  = "CIDR_BLOCK"
+  }
 
   freeform_tags = {
     Name = "${var.project_name}-public-rt"
@@ -119,18 +114,15 @@ resource "oci_core_route_table" "public" {
 }
 
 # プライベート用ルートテーブル
-# [FAULT-NET-01] NATゲートウェイへのルートがない
+# [FAULT-NET-01] NATゲートウェイへのルートがない - 外部通信不可
 resource "oci_core_route_table" "private" {
   compartment_id = var.compartment_id
   vcn_id         = oci_core_vcn.main.id
   display_name   = "${var.project_name}-private-rt"
 
   # NATゲートウェイへのルートが存在しない
-  # route_rules {
-  #   network_entity_id = oci_core_nat_gateway.main.id
-  #   destination       = "0.0.0.0/0"
-  #   destination_type  = "CIDR_BLOCK"
-  # }
+  # プライベートサブネットのリソースはインターネットにアクセスできない
+  # 本来は oci_core_nat_gateway + route_rules の設定が必要
 
   freeform_tags = {
     Name = "${var.project_name}-private-rt"

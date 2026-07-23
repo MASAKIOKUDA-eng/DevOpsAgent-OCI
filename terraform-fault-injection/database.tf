@@ -2,23 +2,25 @@
 # OCI Database System (PostgreSQL)
 #
 # 注入された障害:
-# [FAULT-DB-01] 高可用性(HA)無効 - 単一障害点
+# [FAULT-DB-01] 高可用性(HA)無効 - 単一障害点（instance_count = 1）
 # [FAULT-DB-02] パブリックサブネットに配置 - インターネットからDB直接アクセス可能
 # [FAULT-DB-03] 暗号化にカスタマー管理キー未使用 - デフォルト暗号化のみ
 # [FAULT-DB-04] 自動バックアップ無効 - データ復旧不能
-# [FAULT-DB-05] パスワードがハードコード - セキュリティリスク
-# [FAULT-DB-06] 削除保護なし
+# [FAULT-DB-05] パスワードがvariableのdefaultにハードコード - OCI Vaultを使うべき
+# [FAULT-DB-06] 削除保護なし（lifecycle prevent_destroy未設定）
 ################################################################################
 
-# OCI Database System (PostgreSQL)
+# OCI PostgreSQL Database System
 resource "oci_psql_db_system" "main" {
   compartment_id = var.compartment_id
   display_name   = "${var.project_name}-db"
   db_version     = "14"
 
-  # システム構成 - 本番には不十分なスペック
-  shape = "PostgreSQL.VM.Standard.E4.Flex.2.32GB"
-  instance_count = 1  # [FAULT-DB-01] HA無効 - 単一ノードのみ
+  # [FAULT-DB-01] HA無効 - 単一ノードのみ
+  shape {
+    id = "PostgreSQL.VM.Standard.E4.Flex.2.32GB"
+  }
+  instance_count = 1
 
   # ストレージ設定
   storage_details {
@@ -34,35 +36,28 @@ resource "oci_psql_db_system" "main" {
     nsg_ids   = [oci_core_network_security_group.db.id]
   }
 
-  # データベース設定
-  db_configuration_params {
-    apply_config = "RESTART"
-    config_id    = data.oci_psql_default_configuration.pg14.id
-  }
-
   # 認証情報
+  # [FAULT-DB-05] パスワードが variables.tf のデフォルト値にハードコードされている
   credentials {
     username = "admin"
-    # [FAULT-DB-05] パスワードがTerraformコードにハードコード
     password_details {
       password_type = "PLAIN_TEXT"
-      password      = "password123"  # OCI Vaultを使用すべき
+      password      = var.db_admin_password
     }
   }
 
   # [FAULT-DB-04] 自動バックアップ無効
   management_policy {
     backup_policy {
-      kind              = "NONE"  # バックアップなし - データ復旧不能
-      # 本来は以下のように設定すべき:
-      # kind              = "DAILY"
-      # retention_days    = 7
+      kind = "NONE"  # バックアップなし - データ復旧不能
     }
   }
 
   # [FAULT-DB-06] 削除保護なし
-  # 本来は deletion_protection = true に相当する設定が必要
-  # OCI では terraform destroy 実行時に保護する仕組みがない
+  # 本来は以下が必要:
+  # lifecycle {
+  #   prevent_destroy = true
+  # }
 
   # [FAULT-DB-03] カスタマー管理キー未使用
   # 本来は以下が必要:
@@ -71,10 +66,4 @@ resource "oci_psql_db_system" "main" {
   freeform_tags = {
     Name = "${var.project_name}-db"
   }
-}
-
-# デフォルト設定のデータソース
-data "oci_psql_default_configuration" "pg14" {
-  db_version = "14"
-  shape      = "PostgreSQL.VM.Standard.E4.Flex.2.32GB"
 }
