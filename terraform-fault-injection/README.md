@@ -114,65 +114,144 @@ terraform destroy -auto-approve
 
 ## AWS DevOps Agent と OCI リソースの接続方法
 
-AWS 上で動作する DevOps Agent から OCI リソースを解析・監視するための接続設定です。
+> **参考**: [AWS DevOps Agent 公式ドキュメント](https://docs.aws.amazon.com/devopsagent/latest/userguide/what-is.html)
 
-### 接続アーキテクチャ
+AWS DevOps Agent は、インシデント対応を自動化するフロンティアエージェントです。
+OCI リソースを監視するには、Agent Space にカスタム MCP サーバーを登録し、
+OCI テレメトリを DevOps Agent の調査対象に含める必要があります。
+
+### 全体アーキテクチャ
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  AWS 環境                                           │
-│                                                     │
-│  [DevOps Agent (EC2/Lambda/ECS)]                    │
-│       │                                             │
-│       ├── OCI CLI / SDK（API Key 認証）             │
-│       ├── Terraform OCI Provider                    │
-│       └── OCI REST API 直接呼び出し                 │
-│                                                     │
-└───────┼─────────────────────────────────────────────┘
-        │  HTTPS (443)
-        ▼
-┌─────────────────────────────────────────────────────┐
-│  OCI 環境                                           │
-│                                                     │
-│  [VCN / LB / Container Instances / DB System]       │
-│                                                     │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  AWS 環境 (us-east-1 / ap-northeast-1)                          │
+│                                                                  │
+│  ┌──────────────────────────────────────┐                        │
+│  │  AWS DevOps Agent Space              │                        │
+│  │  ┌────────────┐  ┌────────────────┐  │                        │
+│  │  │ Topology   │  │ Investigation  │  │                        │
+│  │  │ (自動検出)  │  │ (RCA実行)      │  │                        │
+│  │  └────────────┘  └────────────────┘  │                        │
+│  │         │                  │          │                        │
+│  │  ┌──────┴──────────────────┴───────┐  │                        │
+│  │  │ カスタム MCP サーバー (OCI用)    │  │                        │
+│  │  │ - OCI Compute/Network ツール    │  │                        │
+│  │  │ - OCI Database ツール           │  │                        │
+│  │  │ - OCI Monitoring ツール         │  │                        │
+│  │  └────────────────────────────────┘  │                        │
+│  └──────────────────────────────────────┘                        │
+│                     │                                             │
+│                     │ HTTPS (OCI REST API)                        │
+└─────────────────────┼─────────────────────────────────────────────┘
+                      ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  OCI 環境 (ap-tokyo-1)                                           │
+│  [VCN] → [Load Balancer] → [Container Instances] → [DB System]  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 方法1: OCI API Key 認証（推奨）
+### Step 1: Agent Space の作成（Terraform）
 
-AWS 上の DevOps Agent が OCI API を呼び出すための最も標準的な方法です。
+> 参考: [Getting started with AWS DevOps Agent using Terraform](https://docs.aws.amazon.com/devopsagent/latest/userguide/getting-started-with-aws-devops-agent-getting-started-with-aws-devops-agent-using-terraform.html)
 
-#### 1-1. OCI ユーザーと API キーの作成
+`awscc` プロバイダーの `awscc_devopsagent_agent_space` リソースで Agent Space を作成します。
+
+```hcl
+# providers.tf
+terraform {
+  required_providers {
+    awscc = {
+      source  = "hashicorp/awscc"
+      version = "~> 1.0"
+    }
+  }
+}
+
+provider "awscc" {
+  region = "ap-northeast-1"  # 東京リージョン (サポート対象)
+}
+```
+
+```hcl
+# agent_space.tf
+resource "awscc_devopsagent_agent_space" "main" {
+  agent_space_name = "oci-fault-detection"
+
+  # Operator App（Web UI）の設定
+  operator_app_config {
+    iam_identity_center_config {
+      instance_arn = var.idc_instance_arn
+    }
+  }
+
+  tags = [{
+    key   = "Project"
+    value = "DevOpsAgent-OCI"
+  }]
+}
+```
+
+```hcl
+# iam.tf - DevOps Agent が AWS リソースにアクセスするためのIAMロール
+resource "aws_iam_role" "devops_agent" {
+  name = "DevOpsAgentRole-AgentSpace"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "aidevops.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+      Condition = {
+        StringEquals = {
+          "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "devops_agent" {
+  role       = aws_iam_role.devops_agent.name
+  policy_arn = "arn:aws:iam::aws:policy/AIDevOpsAgentAccessPolicy"
+}
+```
+
+```hcl
+# association.tf - AWS アカウントを Agent Space に関連付け
+resource "awscc_devopsagent_association" "aws_account" {
+  agent_space_id = awscc_devopsagent_agent_space.main.agent_space_id
+  service_id     = "aws"
+  type           = "Aws"
+
+  aws_configuration {
+    account_id  = data.aws_caller_identity.current.account_id
+    iam_role_id = aws_iam_role.devops_agent.arn
+  }
+}
+```
+
+### Step 2: OCI 用カスタム MCP サーバーの構築と登録
+
+> 参考: [Connecting MCP Servers](https://docs.aws.amazon.com/devopsagent/latest/userguide/configuring-integrations-and-knowledge-connecting-mcp-servers.html)
+
+MCP サーバーを登録すると、DevOps Agent がインシデント調査時に OCI リソースの状態を
+取得・分析できるようになります。MCP サーバーはアカウントレベルで登録され、
+Agent Space 単位で使用するツールを選択できます。
+
+#### 2-1. OCI 認証情報を AWS Secrets Manager に保存
 
 ```bash
-# OCI CLI でAPIキーペアを生成
-oci setup keys
-
-# 生成されるファイル:
-# ~/.oci/oci_api_key.pem       (秘密鍵)
-# ~/.oci/oci_api_key_public.pem (公開鍵)
-```
-
-#### 1-2. OCI コンソールで公開鍵を登録
-
-1. OCI コンソール → Identity → Users → 対象ユーザー
-2. 「API Keys」→「Add API Key」→ 公開鍵をペースト
-3. 表示される Fingerprint をメモ
-
-#### 1-3. AWS 側での OCI 認証情報の配置
-
-**オプションA: AWS Secrets Manager に保存（推奨）**
-
-```bash
-# OCI 秘密鍵を AWS Secrets Manager に保存
+# OCI API キー（秘密鍵）を保存
 aws secretsmanager create-secret \
-  --name "oci/api-key" \
+  --name "devops-agent/oci-api-key" \
   --secret-string file://~/.oci/oci_api_key.pem
 
-# OCI 接続情報を保存
+# OCI 接続設定を保存
 aws secretsmanager create-secret \
-  --name "oci/config" \
+  --name "devops-agent/oci-config" \
   --secret-string '{
     "tenancy_ocid": "ocid1.tenancy.oc1..xxxxx",
     "user_ocid": "ocid1.user.oc1..xxxxx",
@@ -182,207 +261,303 @@ aws secretsmanager create-secret \
   }'
 ```
 
-**オプションB: ~/.oci/config ファイルを直接配置**
+#### 2-2. OCI MCP サーバーの実装例（Lambda）
 
-```ini
-# ~/.oci/config （AWS EC2上のDevOps Agentインスタンスに配置）
-[DEFAULT]
-user=ocid1.user.oc1..xxxxx
-fingerprint=xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx
-tenancy=ocid1.tenancy.oc1..xxxxx
-region=ap-tokyo-1
-key_file=~/.oci/oci_api_key.pem
+```python
+# lambda/oci_mcp_server/handler.py
+"""
+OCI リソース情報を取得する MCP サーバー (AWS Lambda)
+DevOps Agent から呼び出され、OCI の VCN/NSG/LB/DB 等の状態を返す
+"""
+import json
+import oci
+import boto3
+
+def get_oci_config():
+    """AWS Secrets Manager から OCI 認証情報を取得"""
+    sm = boto3.client("secretsmanager")
+    config_str = sm.get_secret_value(SecretId="devops-agent/oci-config")["SecretString"]
+    key_pem = sm.get_secret_value(SecretId="devops-agent/oci-api-key")["SecretString"]
+    config = json.loads(config_str)
+    config["key_content"] = key_pem
+    return config
+
+def list_vcn_security_issues(event, context):
+    """VCN/NSG のセキュリティ問題を検出する MCP ツール"""
+    config = get_oci_config()
+    vn_client = oci.core.VirtualNetworkClient(config)
+
+    # NSG ルールを取得して問題を検出
+    nsgs = vn_client.list_network_security_groups(
+        compartment_id=config["compartment_id"]
+    ).data
+
+    issues = []
+    for nsg in nsgs:
+        rules = vn_client.list_network_security_group_security_rules(
+            network_security_group_id=nsg.id
+        ).data
+        for rule in rules:
+            if rule.source == "0.0.0.0/0" and rule.direction == "INGRESS":
+                issues.append({
+                    "nsg": nsg.display_name,
+                    "issue": "全世界からのIngressを許可",
+                    "protocol": rule.protocol,
+                    "severity": "HIGH"
+                })
+    return {"issues": issues}
+
+def get_db_system_status(event, context):
+    """PostgreSQL DB System の状態を取得する MCP ツール"""
+    config = get_oci_config()
+    psql_client = oci.psql.PostgresqlClient(config)
+
+    db_systems = psql_client.list_db_systems(
+        compartment_id=config["compartment_id"]
+    ).data.items
+
+    results = []
+    for db in db_systems:
+        detail = psql_client.get_db_system(db_system_id=db.id).data
+        results.append({
+            "name": detail.display_name,
+            "state": detail.lifecycle_state,
+            "instance_count": detail.instance_count,
+            "is_ha": detail.instance_count > 1,
+            "backup_policy": detail.management_policy.backup_policy.kind
+        })
+    return {"db_systems": results}
 ```
 
-#### 1-4. Terraform OCI Provider の設定
+#### 2-3. MCP サーバーの登録（AWS CLI）
+
+```bash
+# DevOps Agent に MCP サーバーを登録
+aws devops-agent register-mcp-server \
+  --agent-space-id <agent-space-id> \
+  --name "oci-infrastructure" \
+  --description "OCI infrastructure inspection tools for fault detection" \
+  --endpoint-url "https://<lambda-function-url>" \
+  --tools '[
+    {
+      "name": "list_vcn_security_issues",
+      "description": "List security issues in OCI VCN/NSG configurations"
+    },
+    {
+      "name": "get_db_system_status",
+      "description": "Get OCI PostgreSQL DB System status and HA configuration"
+    },
+    {
+      "name": "get_load_balancer_health",
+      "description": "Check OCI Load Balancer backend health status"
+    },
+    {
+      "name": "get_container_instance_status",
+      "description": "Get OCI Container Instance runtime status"
+    }
+  ]'
+```
+
+### Step 3: OCI 監視からの Webhook 連携
+
+> 参考: [Invoking DevOps Agent through Webhook](https://docs.aws.amazon.com/devopsagent/latest/userguide/configuring-capabilities-for-aws-devops-agent-invoking-devops-agent-through-webhook.html)
+
+OCI Monitoring のアラームが発火した際に、Webhook で DevOps Agent の調査を自動起動できます。
+
+```bash
+# DevOps Agent の Webhook URL を取得
+WEBHOOK_URL=$(aws devops-agent get-webhook-url \
+  --agent-space-id <agent-space-id> \
+  --output text)
+```
 
 ```hcl
-# DevOps Agent が OCI リソースの状態を取得する場合
-provider "oci" {
-  tenancy_ocid     = var.tenancy_ocid
-  user_ocid        = var.user_ocid
-  fingerprint      = var.fingerprint
-  private_key_path = var.private_key_path
-  region           = var.oci_region
+# OCI 側: アラーム → Notification Topic → HTTPS Webhook
+resource "oci_monitoring_alarm" "lb_unhealthy" {
+  compartment_id = var.compartment_id
+  display_name   = "LB-Backend-Unhealthy"
+  namespace      = "oci_lbaas"
+  query          = "UnHealthyBackendServers[1m].count() > 0"
+  severity       = "CRITICAL"
+  is_enabled     = true
+
+  destinations = [oci_ons_notification_topic.devops_agent.id]
+}
+
+resource "oci_ons_notification_topic" "devops_agent" {
+  compartment_id = var.compartment_id
+  name           = "devops-agent-webhook"
+}
+
+# OCI → AWS DevOps Agent Webhook へ通知
+resource "oci_ons_subscription" "devops_agent_webhook" {
+  compartment_id = var.compartment_id
+  topic_id       = oci_ons_notification_topic.devops_agent.id
+  protocol       = "HTTPS"
+  endpoint       = "<DEVOPS_AGENT_WEBHOOK_URL>"
 }
 ```
 
-### 方法2: OCI Instance Principal（OCI上にAgentを配置する場合）
+### Step 4: DevOps Agent API でタスクを作成
 
-OCI 上にも DevOps Agent のコンポーネントを配置する場合は、Instance Principal 認証が使えます。
+> 参考: [CreateBacklogTask API](https://docs.aws.amazon.com/boto3/latest/reference/services/devops-agent/client/create_backlog_task.html)
 
-```hcl
-# Instance Principal認証 (OCI上のComputeインスタンスから)
-provider "oci" {
-  auth   = "InstancePrincipal"
-  region = var.oci_region
-}
+プログラムから直接 DevOps Agent に調査タスクを作成することもできます。
+
+```python
+import boto3
+
+client = boto3.client("devops-agent", region_name="ap-northeast-1")
+
+# OCI で問題を検知した場合に調査タスクを作成
+response = client.create_backlog_task(
+    agentSpaceId="<agent-space-id>",
+    taskType="INVESTIGATION",
+    title="OCI Load Balancer backend unhealthy - port mismatch suspected",
+    description="""
+    OCI Load Balancer のバックエンドが unhealthy 状態です。
+    ヘルスチェックポート(8080)とコンテナポート(80)の不一致が疑われます。
+
+    影響リソース:
+    - Load Balancer: fault-test-lb
+    - Backend Set: fault-test-backend-set
+    - Container Instance: fault-test-container-instance
+
+    OCI Region: ap-tokyo-1
+    Compartment: <compartment-ocid>
+    """,
+    priority="HIGH"
+)
+
+print(f"Investigation task created: {response['taskId']}")
 ```
 
-```bash
-# ダイナミックグループの作成が必要
-# OCI CLI で作成する例:
-oci iam dynamic-group create \
-  --compartment-id <tenancy_ocid> \
-  --name "DevOpsAgentDG" \
-  --matching-rule "ALL {resource.type = 'instance', resource.compartment.id = '<compartment_ocid>'}" \
-  --description "DevOps Agent instances"
-```
+### Step 5: GitHub 連携による Terraform デプロイ追跡
 
-### 方法3: 環境変数による認証
+> 参考: [Associating AWS resources with project deployments](https://docs.aws.amazon.com/devopsagent/latest/userguide/configuring-capabilities-for-aws-devops-agent-connecting-to-cicd-pipelines-associating-aws-resources-with-project-deployments.html)
 
-CI/CD パイプライン（GitHub Actions等）から実行する場合に適しています。
-
-```bash
-# 環境変数を設定
-export TF_VAR_tenancy_ocid="ocid1.tenancy.oc1..xxxxx"
-export TF_VAR_user_ocid="ocid1.user.oc1..xxxxx"
-export TF_VAR_fingerprint="xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx"
-export TF_VAR_private_key_path="~/.oci/oci_api_key.pem"
-export TF_VAR_compartment_id="ocid1.compartment.oc1..xxxxx"
-
-# OCI CLI 用
-export OCI_CLI_TENANCY="ocid1.tenancy.oc1..xxxxx"
-export OCI_CLI_USER="ocid1.user.oc1..xxxxx"
-export OCI_CLI_FINGERPRINT="xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx"
-export OCI_CLI_KEY_FILE="~/.oci/oci_api_key.pem"
-export OCI_CLI_REGION="ap-tokyo-1"
-```
-
-### 方法4: GitHub Actions での AWS → OCI 連携
+DevOps Agent は GitHub/GitLab と連携し、Terraform のデプロイを追跡できます。
 
 ```yaml
-# .github/workflows/oci-fault-detection.yml
-name: OCI Fault Detection
+# .github/workflows/oci-deploy-and-notify.yml
+name: Deploy OCI Infrastructure & Notify DevOps Agent
 
 on:
   push:
-    paths:
-      - 'terraform-fault-injection/**'
+    branches: [main]
+    paths: ['terraform-fault-injection/**']
 
 jobs:
-  analyze:
+  deploy:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure OCI CLI
+      - name: Configure OCI credentials
         env:
-          OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
-          OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
-          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_PRIVATE_KEY }}
-          OCI_CLI_REGION: ap-tokyo-1
         run: |
           mkdir -p ~/.oci
           echo "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
           chmod 600 ~/.oci/oci_api_key.pem
-          cat > ~/.oci/config <<EOF
-          [DEFAULT]
-          user=$OCI_CLI_USER
-          fingerprint=$OCI_CLI_FINGERPRINT
-          tenancy=$OCI_CLI_TENANCY
-          region=$OCI_CLI_REGION
-          key_file=~/.oci/oci_api_key.pem
-          EOF
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.5.0"
 
-      - name: Terraform Init & Plan
+      - name: Terraform Apply
         working-directory: terraform-fault-injection
         env:
           TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
           TF_VAR_compartment_id: ${{ secrets.OCI_COMPARTMENT_OCID }}
         run: |
           terraform init
-          terraform plan -no-color
+          terraform apply -auto-approve
 
-      - name: Run DevOps Agent Analysis
+      - name: Notify DevOps Agent of deployment
+        env:
+          AWS_REGION: ap-northeast-1
         run: |
-          devops-agent analyze ./terraform-fault-injection/ \
-            --provider oci \
-            --output-format json \
-            > analysis-results.json
-
-      - name: Upload Results
-        uses: actions/upload-artifact@v4
-        with:
-          name: fault-analysis-results
-          path: analysis-results.json
+          # DevOps Agent にデプロイ完了を通知
+          aws devops-agent create-backlog-task \
+            --agent-space-id ${{ secrets.AGENT_SPACE_ID }} \
+            --task-type EVALUATION \
+            --title "OCI Terraform deployment completed - evaluate infrastructure" \
+            --description "Terraform apply completed for OCI fault-injection test environment. Evaluate deployed resources for security and reliability issues." \
+            --priority MEDIUM
 ```
 
-### 必要な IAM ポリシー（OCI側）
+### Step 6: OCI 側の IAM ポリシー設定
 
-DevOps Agent がOCIリソースを読み取るために必要な最小権限ポリシーです。
+MCP サーバー（Lambda）が OCI API を呼び出すために必要な OCI IAM ポリシーです。
 
 ```hcl
-# OCI IAM Policy - DevOps Agent 用（読み取り専用）
+# OCI IAM Policy - DevOps Agent MCP サーバー用（読み取り専用）
 resource "oci_identity_policy" "devops_agent_readonly" {
   compartment_id = var.tenancy_ocid
   name           = "devops-agent-readonly-policy"
-  description    = "Allow DevOps Agent to inspect OCI resources"
+  description    = "Allow DevOps Agent MCP server to inspect OCI resources"
 
   statements = [
-    # ネットワークリソースの読み取り
     "Allow group DevOpsAgentGroup to inspect vcns in compartment id ${var.compartment_id}",
     "Allow group DevOpsAgentGroup to inspect subnets in compartment id ${var.compartment_id}",
     "Allow group DevOpsAgentGroup to inspect network-security-groups in compartment id ${var.compartment_id}",
     "Allow group DevOpsAgentGroup to inspect route-tables in compartment id ${var.compartment_id}",
-
-    # Load Balancer の読み取り
     "Allow group DevOpsAgentGroup to inspect load-balancers in compartment id ${var.compartment_id}",
-
-    # Container Instances の読み取り
     "Allow group DevOpsAgentGroup to inspect compute-container-instances in compartment id ${var.compartment_id}",
-
-    # Database の読み取り
     "Allow group DevOpsAgentGroup to inspect postgresql-db-systems in compartment id ${var.compartment_id}",
-
-    # タグ・コンパートメントの読み取り
+    "Allow group DevOpsAgentGroup to read metrics in compartment id ${var.compartment_id}",
+    "Allow group DevOpsAgentGroup to read log-content in compartment id ${var.compartment_id}",
     "Allow group DevOpsAgentGroup to inspect compartments in tenancy",
   ]
 }
 ```
 
-### 接続テスト
+### ネットワーク接続オプション
 
-DevOps Agent から OCI への接続を確認するコマンド例です。
-
-```bash
-# OCI CLI でリージョン一覧を取得（認証テスト）
-oci iam region list
-
-# コンパートメント内のVCN一覧を取得
-oci network vcn list --compartment-id <compartment_ocid>
-
-# Terraform で plan を実行（認証＋権限テスト）
-cd terraform-fault-injection
-terraform init
-terraform plan -var="tenancy_ocid=<tenancy_ocid>" -var="compartment_id=<compartment_ocid>"
-```
-
-### AWS DevOps Agent と OCI のネットワーク接続（オプション）
-
-デプロイ済みの OCI リソースに対して動的検証（ヘルスチェック確認等）を行う場合は、
-ネットワークレベルの接続も必要です。
+OCI リソースへの動的アクセスが必要な場合のネットワーク接続方式です。
 
 | 接続方式 | ユースケース | 設定難易度 |
 |---------|-------------|-----------|
-| **インターネット経由** | LBのパブリックIPに対するヘルスチェック | 低 |
+| **インターネット経由（HTTPS）** | OCI REST API 呼び出し、LB ヘルスチェック | 低 |
 | **OCI FastConnect + AWS Direct Connect** | プライベート接続（本番向け） | 高 |
-| **IPSec VPN** | AWS VPC ↔ OCI VCN のサイト間VPN | 中 |
-| **Megaport/Equinix** | サードパーティ経由のクロスクラウド接続 | 中 |
+| **IPSec VPN** | AWS VPC ↔ OCI VCN のサイト間 VPN | 中 |
+| **AWS PrivateLink → Lambda → OCI API** | プライベートサブネットからのAPI呼び出し | 中 |
+
+> **注**: DevOps Agent の MCP サーバー（Lambda）から OCI REST API への呼び出しは
+> インターネット経由（HTTPS）で行われます。Lambda に VPC を設定する場合は
+> NAT Gateway が必要です。
+
+### 接続確認チェックリスト
 
 ```bash
-# デプロイ後にLBのパブリックIPへ接続テスト（インターネット経由）
-LB_IP=$(terraform output -raw lb_ip_addresses | jq -r '.[0].ip_address')
-curl -v http://${LB_IP}/
+# 1. Agent Space の確認
+aws devops-agent list-agent-spaces
 
-# 期待結果: ポート不一致により502 Bad Gatewayまたはタイムアウト
-# → DevOps Agent はこの異常を検知すべき
+# 2. MCP サーバーの登録確認
+aws devops-agent list-mcp-servers --agent-space-id <agent-space-id>
+
+# 3. OCI 認証テスト（Lambda から実行される処理と同等）
+python -c "
+import oci, json, boto3
+sm = boto3.client('secretsmanager')
+config = json.loads(sm.get_secret_value(SecretId='devops-agent/oci-config')['SecretString'])
+config['key_content'] = sm.get_secret_value(SecretId='devops-agent/oci-api-key')['SecretString']
+client = oci.core.VirtualNetworkClient(config)
+vcns = client.list_vcns(compartment_id=config['compartment_id']).data
+print(f'Found {len(vcns)} VCNs')
+"
+
+# 4. Webhook テスト
+curl -X POST <WEBHOOK_URL> \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Test: OCI LB unhealthy backend", "priority": "LOW"}'
+
+# 5. DevOps Agent Web App でトポロジ確認
+# https://console.aws.amazon.com/aidevops → Agent Space → Topology
 ```
 
 ---
