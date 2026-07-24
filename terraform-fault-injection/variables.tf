@@ -8,10 +8,14 @@ variable "oci_region" {
   default     = "ap-tokyo-1"
 }
 
+variable "tenancy_ocid" {
+  description = "OCI Tenancy OCID"
+  type        = string
+}
+
 variable "compartment_id" {
   description = "OCI Compartment OCID"
   type        = string
-  default     = "ocid1.compartment.oc1..exampleocid"
 }
 
 variable "project_name" {
@@ -26,8 +30,10 @@ variable "vcn_cidr" {
   default     = "10.0.0.0/16"
 }
 
-variable "tenancy_ocid" {
-  description = "OCI Tenancy OCID"
+variable "db_admin_password" {
+  description = "PostgreSQL admin password"
   type        = string
-  default     = "ocid1.tenancy.oc1..exampleocid"
+  sensitive   = true
+  # [FAULT-DB-05] デフォルト値にハードコードパスワード - OCI Vaultを使うべき
+  default = "FaultTest_Pass123!"
 }
